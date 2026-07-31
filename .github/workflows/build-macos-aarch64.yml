@@ -1,0 +1,59 @@
+# Manual build of patched grok (xai-grok-pager) for macOS Apple Silicon.
+name: build-macos-aarch64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14 # 3-core M1, arm64
+    timeout-minutes: 180
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-aarch64-cargo-
+
+      - name: Install DotSlash
+        run: |
+          cargo install dotslash --locked || cargo install dotslash
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          /usr/bin/env dotslash --help >/dev/null
+
+      - name: Build release binary
+        run: cargo build -p xai-grok-pager-bin --release
+
+      - name: Package artifact
+        run: |
+          cp target/release/xai-grok-pager grok-macos-aarch64
+          chmod +x grok-macos-aarch64
+          ls -lh grok-macos-aarch64
+          file grok-macos-aarch64
+          ./grok-macos-aarch64 --version || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok-macos-aarch64
+          path: grok-macos-aarch64
+          if-no-files-found: error
+          retention-days: 14
