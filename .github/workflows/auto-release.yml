@@ -1,0 +1,393 @@
+# Monitor official Grok CLI stable version and auto-build patched binaries.
+#
+# Version source: https://x.ai/cli/stable (not upstream GitHub Releases —
+# xai-org/grok-build has none).
+#
+# Flow: detect → sync upstream + apply patches/ → build → GitHub Release → Issue notify
+name: auto-release
+
+on:
+  schedule:
+    # UTC every 6 hours
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: "Force build for this official version (e.g. 0.2.118). Empty = use latest stable if newer than last release."
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "Only detect / print decision; do not sync, build, or release"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+  actions: read
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+      version: ${{ steps.decide.outputs.version }}
+      last_release: ${{ steps.decide.outputs.last_release }}
+      official: ${{ steps.decide.outputs.official }}
+    steps:
+      - name: Fetch official stable version
+        id: official
+        run: |
+          set -euo pipefail
+          ver="$(curl -fsSL --max-time 30 https://x.ai/cli/stable 2>/dev/null | tr -d '\r\n[:space:]' || true)"
+          if [ -z "$ver" ]; then
+            echo "Primary probe failed; trying GCS fallback..."
+            ver="$(curl -fsSL --max-time 30 https://storage.googleapis.com/grok-build-public-artifacts/cli/stable 2>/dev/null | tr -d '\r\n[:space:]' || true)"
+          fi
+          if [[ ! "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._]+)?$ ]]; then
+            echo "::error::Failed to resolve official stable version (got: '${ver}')"
+            exit 1
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Official stable: $ver"
+
+      - name: Latest release tag on this fork
+        id: last
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$(gh release list --repo "${{ github.repository }}" --limit 50 --json tagName,isLatest,createdAt \
+            --jq '[.[] | select(.tagName | test("^v[0-9]"))] | sort_by(.createdAt) | reverse | .[0].tagName // empty' 2>/dev/null || true)"
+          last="${tag#v}"
+          if [ -z "$last" ]; then
+            last="0.0.0"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "last_release=$last" >> "$GITHUB_OUTPUT"
+          echo "Last release: ${last} (tag=${tag:-none})"
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force_version || '' }}
+          DRY: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+        run: |
+          set -euo pipefail
+          official="${{ steps.official.outputs.version }}"
+          last="${{ steps.last.outputs.last_release }}"
+
+          if [ -n "${FORCE}" ]; then
+            version="${FORCE}"
+            should="true"
+            reason="force_version=${FORCE}"
+          else
+            version="${official}"
+            # Build only when official is strictly newer than last release (semver sort).
+            newest="$(printf '%s\n%s\n' "${last}" "${official}" | sort -V | tail -n1)"
+            if [ "${newest}" = "${official}" ] && [ "${official}" != "${last}" ]; then
+              should="true"
+              reason="official ${official} > last release ${last}"
+            else
+              should="false"
+              reason="official ${official} not newer than last release ${last}"
+            fi
+          fi
+
+          if [ "${DRY}" = "true" ]; then
+            should="false"
+            reason="dry_run=true (${reason})"
+          fi
+
+          {
+            echo "should_build=${should}"
+            echo "version=${version}"
+            echo "last_release=${last}"
+            echo "official=${official}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "### auto-release detect" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Official stable | \`${official}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Last release | \`${last}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Target version | \`${version}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| should_build | \`${should}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Reason | ${reason} |" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Decision: should_build=${should} version=${version} (${reason})"
+
+  sync:
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sync.outputs.sha }}
+      source_rev: ${{ steps.sync.outputs.source_rev }}
+      branch: ${{ steps.sync.outputs.branch }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync upstream + apply patches
+        id: sync
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/xai-org/grok-build.git 2>/dev/null || true
+          git fetch upstream main
+          git fetch origin main
+
+          # Keep automation assets from the tip of origin/main (this workflow + patches).
+          KEEP="$(mktemp -d)"
+          git archive "origin/main" patches .github | tar -x -C "${KEEP}"
+
+          BRANCH="auto/v${VERSION}"
+          git checkout -B "${BRANCH}" upstream/main
+
+          rm -rf patches .github
+          cp -a "${KEEP}/patches" .
+          cp -a "${KEEP}/.github" .
+
+          failed=0
+          shopt -s nullglob
+          for p in patches/*.patch; do
+            echo "Applying ${p}..."
+            if ! git apply --3way "${p}"; then
+              echo "::error::Failed to apply ${p}"
+              failed=1
+            fi
+          done
+
+          if [ "${failed}" -ne 0 ]; then
+            # Open conflict issue before failing the job.
+            body_file="$(mktemp)"
+            cat > "${body_file}" <<EOF
+          ## Patch conflict while preparing mygrok v${VERSION}
+
+          Automatic sync could not apply one or more patches in \`patches/\` onto \`xai-org/grok-build\` main.
+
+          - **Official stable target:** \`${VERSION}\`
+          - **Upstream SHA:** \`$(git rev-parse upstream/main)\`
+          - **Workflow run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          ### Next steps
+          1. Rebase / fix the conflicting files against upstream.
+          2. Regenerate patches (see \`patches/README.md\`).
+          3. Push to \`main\`, then re-run **auto-release** (\`workflow_dispatch\`).
+
+          _Label: \`patch-conflict\`_
+          EOF
+            # Trim leading spaces from heredoc accidental indent
+            sed -i 's/^          //' "${body_file}"
+            gh label create patch-conflict --color B60205 --description "Local patches failed to apply" 2>/dev/null || true
+            gh issue create \
+              --title "[mygrok] patch conflict preparing v${VERSION}" \
+              --label "patch-conflict" \
+              --body-file "${body_file}" || true
+            exit 1
+          fi
+
+          SOURCE_REV="$(tr -d '\r\n' < SOURCE_REV 2>/dev/null || echo unknown)"
+          UPSTREAM_SHA="$(git rev-parse upstream/main)"
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No file changes after applying patches (unexpected)."
+            # Still commit automation tree if needed
+          fi
+
+          git commit --allow-empty -m "chore(auto): apply local patches for official v${VERSION}
+
+          Official stable: ${VERSION}
+          Upstream: ${UPSTREAM_SHA}
+          SOURCE_REV: ${SOURCE_REV}
+          "
+
+          git push -u origin "HEAD:${BRANCH}" --force-with-lease
+          # Keep main = upstream + patches + automation (successful path only).
+          git push origin "HEAD:main" --force-with-lease
+
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "source_rev=${SOURCE_REV}"
+            echo "branch=${BRANCH}"
+            echo "upstream_sha=${UPSTREAM_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Synced branch ${BRANCH} @ $(git rev-parse --short HEAD)"
+
+  build:
+    needs: [detect, sync]
+    if: needs.detect.outputs.should_build == 'true' && needs.sync.result == 'success'
+    uses: ./.github/workflows/build-release.yml
+    with:
+      ref: ${{ needs.sync.outputs.branch }}
+
+  release:
+    needs: [detect, sync, build]
+    if: |
+      always() &&
+      needs.detect.outputs.should_build == 'true' &&
+      needs.sync.result == 'success' &&
+      needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: mygrok-*
+          merge-multiple: false
+
+      - name: List artifacts
+        run: find dist -type f -ls
+
+      - name: Stage release assets
+        id: stage
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          # Flatten whatever layout download-artifact produced
+          find dist -type f \( -name 'mygrok-*' -o -name 'mygrok-*.exe' \) -print0 | while IFS= read -r -d '' f; do
+            cp -v "$f" "release-assets/$(basename "$f")"
+          done
+          ls -la release-assets
+          count="$(find release-assets -type f | wc -l)"
+          if [ "${count}" -lt 1 ]; then
+            echo "::error::No release assets found"
+            exit 1
+          fi
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.detect.outputs.version }}
+          SHA: ${{ needs.sync.outputs.sha }}
+          SOURCE_REV: ${{ needs.sync.outputs.source_rev }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+          BRANCH: ${{ needs.sync.outputs.branch }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          NOTES="$(mktemp)"
+          cat > "${NOTES}" <<EOF
+          ## mygrok ${TAG}
+
+          Patched self-build of [xai-org/grok-build](https://github.com/xai-org/grok-build), triggered by **official CLI stable** version \`${VERSION}\`.
+
+          | Field | Value |
+          |-------|-------|
+          | Official stable | \`${VERSION}\` |
+          | Build commit | \`${SHA}\` |
+          | Branch | \`${BRANCH}\` |
+          | Upstream main | \`${UPSTREAM_SHA}\` |
+          | SOURCE_REV | \`${SOURCE_REV}\` |
+
+          ### Assets
+          - \`mygrok-windows-x64.exe\` — Windows x64
+          - \`mygrok-macos-aarch64\` — macOS Apple Silicon
+
+          ### Local patches
+          See [\`patches/\`](https://github.com/${{ github.repository }}/tree/main/patches) (SSRF allow 198.18/15 for Clash fake-ip; Windows protoc build fix).
+
+          ### Caveat
+          The **trigger** is the official install channel version (\`https://x.ai/cli/stable\`).
+          The **source** is the open-source tree + local patches, which may lag or differ slightly from the proprietary binary published by xAI.
+
+          Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EOF
+
+          # Idempotent: delete draft/failed same tag if re-run
+          if gh release view "${TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; uploading assets only if missing is not automated — deleting and recreating."
+            gh release delete "${TAG}" --repo "${{ github.repository }}" --yes --cleanup-tag
+          fi
+
+          gh release create "${TAG}" \
+            --repo "${{ github.repository }}" \
+            --title "mygrok ${TAG}" \
+            --notes-file "${NOTES}" \
+            --target "${SHA}" \
+            release-assets/*
+
+      - name: Notify success via Issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          gh label create release-notify --color 0E8A16 --description "Successful mygrok auto-release" 2>/dev/null || true
+          body="$(mktemp)"
+          cat > "${body}" <<EOF
+          ## mygrok ${TAG} published
+
+          - **Release:** ${{ github.server_url }}/${{ github.repository }}/releases/tag/${TAG}
+          - **Workflow:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          - **Official stable:** \`${VERSION}\`
+          - **Commit:** \`${{ needs.sync.outputs.sha }}\`
+
+          Download Windows: \`mygrok-windows-x64.exe\` from the release page, then replace \`%USERPROFILE%\\.mygrok\\bin\\mygrok.exe\`.
+          EOF
+          gh issue create \
+            --title "[mygrok] released ${TAG}" \
+            --label "release-notify" \
+            --body-file "${body}"
+
+  notify-failure:
+    needs: [detect, sync, build, release]
+    if: |
+      always() &&
+      needs.detect.outputs.should_build == 'true' &&
+      (
+        needs.sync.result == 'failure' ||
+        needs.build.result == 'failure' ||
+        needs.release.result == 'failure'
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open failure Issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh label create build-failure --color D93F0B --description "mygrok auto-release failed" 2>/dev/null || true
+          body="$(mktemp)"
+          cat > "${body}" <<EOF
+          ## mygrok auto-release failed (v${VERSION})
+
+          | Job | Result |
+          |-----|--------|
+          | detect | \`${{ needs.detect.result }}\` |
+          | sync | \`${{ needs.sync.result }}\` |
+          | build | \`${{ needs.build.result }}\` |
+          | release | \`${{ needs.release.result }}\` |
+
+          **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          If \`sync\` failed with a patch apply error, see any \`patch-conflict\` issue opened by that job and update \`patches/\`.
+          EOF
+          # Avoid duplicate spam: skip if a patch-conflict issue was already opened for this version in the last hour (best-effort).
+          gh issue create \
+            --title "[mygrok] auto-build failed v${VERSION}" \
+            --label "build-failure" \
+            --body-file "${body}" || true

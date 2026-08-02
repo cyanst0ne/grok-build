@@ -1,0 +1,149 @@
+# Multi-platform release build of patched grok (xai-grok-pager).
+# - macOS Apple Silicon (aarch64)
+# - Windows 11-class x64 (non-ARM, MSVC)
+#
+# Callable from auto-release.yml, or run manually via workflow_dispatch.
+name: build-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch/tag/SHA). Empty = current branch."
+        required: false
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref to build (branch/tag/SHA). Empty = caller default."
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            artifact: mygrok-macos-aarch64
+            bin: xai-grok-pager
+            jobs: "2"
+          - os: windows-latest # Windows Server 2022 / Win11-class, x86_64
+            artifact: mygrok-windows-x64
+            bin: xai-grok-pager.exe
+            jobs: "4"
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: ${{ matrix.jobs }}
+      CARGO_INCREMENTAL: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref != '' && inputs.ref || github.sha }}
+          fetch-depth: 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # v2: bust Windows caches that still contained /DEBUG PDB objects
+          key: ${{ runner.os }}-${{ matrix.artifact }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.artifact }}-cargo-v2-
+
+      # Official protoc for Windows: bin/protoc is a DotSlash wrapper (not a
+      # valid Win32 app). Prefer a real protoc.exe via $PROTOC.
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ver = "29.3"
+          $zip = "protoc-$ver-win64.zip"
+          $url = "https://github.com/protocolbuffers/protobuf/releases/download/v$ver/$zip"
+          $dest = Join-Path $env:RUNNER_TEMP "protoc"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $zipPath = Join-Path $env:RUNNER_TEMP $zip
+          Invoke-WebRequest -Uri $url -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath $dest -Force
+          $protoc = Join-Path $dest "bin\protoc.exe"
+          if (-not (Test-Path $protoc)) { throw "protoc.exe not found at $protoc" }
+          & $protoc --version
+          "PROTOC=$protoc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$(Join-Path $dest 'bin')" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install DotSlash (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cargo install dotslash --locked || cargo install dotslash
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          /usr/bin/env dotslash --help >/dev/null
+
+      - name: Build release binary (Unix)
+        if: runner.os != 'Windows'
+        run: cargo build -p xai-grok-pager-bin --release
+
+      # Windows MSVC hits LNK4319 (PDB public-symbol limit) when link.exe is
+      # passed /DEBUG. Force no debuginfo, strip symbols, and override MSVC
+      # /DEBUG via link-arg. Also clear target/ so cached deps with PDBs are
+      # not reused.
+      - name: Build release binary (Windows)
+        if: runner.os == 'Windows'
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: "0"
+          CARGO_PROFILE_RELEASE_STRIP: "symbols"
+          RUSTFLAGS: "-C debuginfo=0 -C strip=symbols -C link-arg=/DEBUG:NONE"
+        run: |
+          if (Test-Path target) { Remove-Item -Recurse -Force target }
+          cargo build -p xai-grok-pager-bin --release
+        shell: pwsh
+
+      - name: Package artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp "target/release/${{ matrix.bin }}" "${{ matrix.artifact }}"
+          chmod +x "${{ matrix.artifact }}"
+          ls -lh "${{ matrix.artifact }}"
+          file "${{ matrix.artifact }}" || true
+          "./${{ matrix.artifact }}" --version || true
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item "target/release/${{ matrix.bin }}" "${{ matrix.artifact }}.exe"
+          Get-Item "${{ matrix.artifact }}.exe" | Format-List Name, Length
+          & ".\\${{ matrix.artifact }}.exe" --version
+
+      - name: Upload artifact (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.exe
+          if-no-files-found: error
+          retention-days: 14
