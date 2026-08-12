@@ -1,0 +1,32 @@
+diff --git a/crates/build/xai-proto-build/src/lib.rs b/crates/build/xai-proto-build/src/lib.rs
+index 66613d0..cf88d33 100644
+--- a/crates/build/xai-proto-build/src/lib.rs
++++ b/crates/build/xai-proto-build/src/lib.rs
+@@ -107,6 +107,7 @@ impl XaiProtoBuilder {
+         protos: impl IntoIterator<Item = &'a Path>,
+         includes: impl IntoIterator<Item = &'a Path>,
+     ) -> anyhow::Result<()> {
++        let protos: Vec<&Path> = protos.into_iter().collect();
+         let includes = Vec::from_iter(includes);
+ 
+         if let Some(protoc) = protoc {
+@@ -116,6 +117,19 @@ impl XaiProtoBuilder {
+             );
+         }
+ 
++        // Windows has no /dev/stdout or /dev/null. protoc's --dependency_out
++        // path used below is Unix-only; on Windows fall back to declaring the
++        // .proto inputs themselves as rebuild triggers (good enough for CI).
++        if cfg!(windows) {
++            for proto in &protos {
++                println!(
++                    "cargo:rerun-if-changed={}",
++                    proto.to_str().context("proto path not UTF-8")?
++                );
++            }
++            return Ok(());
++        }
++
+         // Can only process one input file when using --dependency_out=FILE.
+         for proto in protos {
+             let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
