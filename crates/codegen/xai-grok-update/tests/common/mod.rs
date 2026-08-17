@@ -49,8 +49,11 @@ pub fn test_home() -> &'static PathBuf {
         let path = dir.keep();
         // SAFETY: called once at OnceLock init, before any other thread touches
         // these env vars. Tests using this helper must be `#[serial]`.
+        let mygrok = path.join("mygrok");
+        let _ = std::fs::create_dir_all(&mygrok);
         unsafe {
             std::env::set_var("GROK_HOME", &path);
+            std::env::set_var("MYGROK_HOME", &mygrok);
             std::env::remove_var("GROK_TEST_VERSION");
             std::env::remove_var("NPM_TOKEN");
             std::env::remove_var("GROK_INSTALLER");
@@ -71,6 +74,12 @@ pub fn reset_home() {
     let _ = std::fs::remove_file(home.join("version.json.tmp"));
     let _ = std::fs::remove_dir_all(home.join("bin"));
     let _ = std::fs::remove_dir_all(home.join("downloads"));
+    if let Ok(mh) = std::env::var("MYGROK_HOME") {
+        let mh = PathBuf::from(mh);
+        let _ = std::fs::remove_file(mh.join("installed-version"));
+        let _ = std::fs::remove_dir_all(mh.join("bin"));
+        let _ = std::fs::remove_dir_all(mh.join("downloads"));
+    }
     // SAFETY: tests using this helper must be `#[serial]`.
     unsafe {
         std::env::remove_var("GROK_TEST_VERSION");
