@@ -11,7 +11,118 @@ use xai_grok_shell::util::grok_home::grok_home;
 
 const TTL_SECONDS_BEFORE_AUTO_UPDATE: Duration = Duration::from_secs(60 * 30);
 const NPM_PACKAGE: &str = "@xai-official/grok";
-pub const GH_RELEASE_REPO: &str = "xai-org-shared/grok-build";
+/// Default GitHub repo for `mygrok update` (fork Releases, not official CDN).
+pub const DEFAULT_GH_RELEASE_REPO: &str = "cyanst0ne/grok-build";
+/// Alias of [`DEFAULT_GH_RELEASE_REPO`] for existing call sites / tests.
+pub const GH_RELEASE_REPO: &str = DEFAULT_GH_RELEASE_REPO;
+
+/// `owner/repo` slug: no URLs, flags, or extra path segments.
+pub(crate) fn is_valid_gh_repo(repo: &str) -> bool {
+    let mut parts = repo.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    fn ok_part(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= 100
+            && !s.starts_with('.')
+            && !s.starts_with('-')
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    }
+    ok_part(owner) && ok_part(name)
+}
+
+/// GitHub `owner/repo` used by the gh-release installer.
+///
+/// Override with `GROK_GH_RELEASE_REPO`. Invalid values are ignored (default
+/// kept) so a malformed env cannot retarget `gh release download`.
+pub fn gh_release_repo() -> String {
+    match std::env::var("GROK_GH_RELEASE_REPO") {
+        Ok(v) => {
+            let v = v.trim();
+            if is_valid_gh_repo(v) {
+                v.to_string()
+            } else {
+                if !v.is_empty() {
+                    tracing::warn!(
+                        "GROK_GH_RELEASE_REPO ignored: expected owner/repo, got {v:?}"
+                    );
+                }
+                DEFAULT_GH_RELEASE_REPO.to_string()
+            }
+        }
+        Err(_) => DEFAULT_GH_RELEASE_REPO.to_string(),
+    }
+}
+
+/// Install / download root for the mygrok binary (`~/.mygrok`).
+///
+/// Independent of `GROK_HOME` (`~/.grok`): auth, sessions, and config stay
+/// shared with official grok. Override with `MYGROK_HOME`.
+pub fn mygrok_home() -> std::path::PathBuf {
+    match std::env::var("MYGROK_HOME") {
+        Ok(v) => {
+            let v = v.trim();
+            if !v.is_empty() {
+                return std::path::PathBuf::from(v);
+            }
+        }
+        Err(_) => {}
+    }
+    #[allow(deprecated)]
+    let home = std::env::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".mygrok")
+}
+
+/// On-disk binary name under `{mygrok_home}/bin`.
+pub fn mygrok_bin_name() -> &'static str {
+    if cfg!(windows) {
+        "mygrok.exe"
+    } else {
+        "mygrok"
+    }
+}
+
+/// Fork Release asset for this OS/arch (matches auto-release.yml).
+pub fn mygrok_release_asset(os: &str, arch: &str) -> anyhow::Result<&'static str> {
+    match (os, arch) {
+        ("windows", "x86_64") => Ok("mygrok-windows-x64.exe"),
+        ("macos", "aarch64") => Ok("mygrok-macos-aarch64"),
+        ("linux", "x86_64") => Ok("mygrok-linux-x64"),
+        ("linux", "aarch64") => Ok("mygrok-linux-aarch64"),
+        _ => anyhow::bail!(
+            "No mygrok GitHub Release asset for {os}-{arch}. \
+             Published assets: mygrok-windows-x64.exe, mygrok-macos-aarch64"
+        ),
+    }
+}
+
+const MYGROK_INSTALLED_VERSION: &str = "installed-version";
+
+/// Version last successfully installed into `{mygrok_home}/bin`, if the
+/// binary is still present. Used as the disk-version probe so auto-update
+/// does not re-download every launch.
+pub fn installed_mygrok_version() -> Option<String> {
+    let home = mygrok_home();
+    std::fs::metadata(home.join("bin").join(mygrok_bin_name())).ok()?;
+    let raw = std::fs::read_to_string(home.join(MYGROK_INSTALLED_VERSION)).ok()?;
+    let v = raw.trim();
+    semver::Version::parse(v).ok()?;
+    Some(v.to_string())
+}
+
+/// Record the version just installed into `{mygrok_home}`.
+pub fn write_mygrok_installed_version(version: &str) {
+    let home = mygrok_home();
+    if let Err(e) = std::fs::create_dir_all(&home) {
+        tracing::warn!("failed to create mygrok home: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::write(home.join(MYGROK_INSTALLED_VERSION), version) {
+        tracing::warn!("failed to write mygrok installed-version: {e}");
+    }
+}
 
 /// Primary CLI base URL: Cloudflare-fronted x.ai endpoint with edge caching
 /// for binaries and origin-respecting no-cache for channel pointers.
@@ -222,11 +333,12 @@ pub async fn fetch_gh_release_version(channel: &str) -> Result<String> {
 }
 
 async fn fetch_gh_release_latest(exclude_pre: bool) -> Result<String> {
+    let repo = gh_release_repo();
     let mut args = vec![
         "release",
         "list",
         "--repo",
-        GH_RELEASE_REPO,
+        repo.as_str(),
         "--limit",
         "1",
         "--exclude-drafts",
@@ -253,7 +365,7 @@ async fn fetch_gh_release_latest(exclude_pre: bool) -> Result<String> {
     // Tags are formatted as "v0.1.141", strip the leading "v"
     let version = tag.strip_prefix('v').unwrap_or(&tag).to_string();
     if version.is_empty() {
-        anyhow::bail!("No releases found in {}", GH_RELEASE_REPO);
+        anyhow::bail!("No releases found in {}", repo);
     }
     Ok(version)
 }
@@ -829,5 +941,112 @@ mod tests {
         use xai_grok_shell::env::GrokBuildEnvironment;
         let cfg = UpdateConfig::from_environment(&GrokBuildEnvironment::Production);
         assert_eq!(cfg.channel, "stable");
+    }
+
+    #[test]
+    fn test_is_valid_gh_repo() {
+        assert!(is_valid_gh_repo("cyanst0ne/grok-build"));
+        assert!(is_valid_gh_repo("xai-org/grok-build"));
+        assert!(is_valid_gh_repo("a/b"));
+        assert!(!is_valid_gh_repo(""));
+        assert!(!is_valid_gh_repo("nopath"));
+        assert!(!is_valid_gh_repo("too/many/parts"));
+        assert!(!is_valid_gh_repo("https://github.com/cyanst0ne/grok-build"));
+        assert!(!is_valid_gh_repo("-evil/repo"));
+        assert!(!is_valid_gh_repo(".hidden/repo"));
+        assert!(!is_valid_gh_repo("owner/"));
+        assert!(!is_valid_gh_repo("/repo"));
+        assert!(!is_valid_gh_repo("owner/repo;rm"));
+        assert!(!is_valid_gh_repo("owner/repo --clobber"));
+    }
+
+    #[test]
+    fn test_mygrok_release_asset_mapping() {
+        assert_eq!(
+            mygrok_release_asset("windows", "x86_64").unwrap(),
+            "mygrok-windows-x64.exe"
+        );
+        assert_eq!(
+            mygrok_release_asset("macos", "aarch64").unwrap(),
+            "mygrok-macos-aarch64"
+        );
+        assert_eq!(
+            mygrok_release_asset("linux", "x86_64").unwrap(),
+            "mygrok-linux-x64"
+        );
+        assert!(mygrok_release_asset("windows", "aarch64").is_err());
+    }
+
+    #[test]
+    fn test_mygrok_bin_name_matches_platform() {
+        if cfg!(windows) {
+            assert_eq!(mygrok_bin_name(), "mygrok.exe");
+        } else {
+            assert_eq!(mygrok_bin_name(), "mygrok");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_gh_release_repo_default_and_env() {
+        let prev_repo = std::env::var_os("GROK_GH_RELEASE_REPO");
+        unsafe { std::env::remove_var("GROK_GH_RELEASE_REPO") };
+        assert_eq!(gh_release_repo(), DEFAULT_GH_RELEASE_REPO);
+
+        unsafe { std::env::set_var("GROK_GH_RELEASE_REPO", "other-org/other-repo") };
+        assert_eq!(gh_release_repo(), "other-org/other-repo");
+
+        unsafe { std::env::set_var("GROK_GH_RELEASE_REPO", "https://evil.example/x") };
+        assert_eq!(gh_release_repo(), DEFAULT_GH_RELEASE_REPO);
+
+        unsafe { std::env::set_var("GROK_GH_RELEASE_REPO", "") };
+        assert_eq!(gh_release_repo(), DEFAULT_GH_RELEASE_REPO);
+
+        match prev_repo {
+            Some(v) => unsafe { std::env::set_var("GROK_GH_RELEASE_REPO", v) },
+            None => unsafe { std::env::remove_var("GROK_GH_RELEASE_REPO") },
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_installed_mygrok_version_requires_binary_and_stamp() {
+        let prev = std::env::var_os("MYGROK_HOME");
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("MYGROK_HOME", dir.path()) };
+        assert_eq!(installed_mygrok_version(), None);
+
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("bin").join(mygrok_bin_name()), b"x").unwrap();
+        assert_eq!(installed_mygrok_version(), None, "stamp missing");
+
+        write_mygrok_installed_version("1.0.3");
+        assert_eq!(installed_mygrok_version().as_deref(), Some("1.0.3"));
+
+        write_mygrok_installed_version("not-semver");
+        assert_eq!(installed_mygrok_version(), None);
+
+        std::fs::remove_file(dir.path().join("bin").join(mygrok_bin_name())).unwrap();
+        write_mygrok_installed_version("1.0.3");
+        assert_eq!(installed_mygrok_version(), None, "binary missing");
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("MYGROK_HOME", v) },
+            None => unsafe { std::env::remove_var("MYGROK_HOME") },
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_mygrok_home_env_override() {
+        let prev = std::env::var_os("MYGROK_HOME");
+        unsafe { std::env::set_var("MYGROK_HOME", r"D:\custom\mygrok") };
+        assert_eq!(mygrok_home(), std::path::PathBuf::from(r"D:\custom\mygrok"));
+        unsafe { std::env::set_var("MYGROK_HOME", "   ") };
+        assert!(mygrok_home().ends_with(".mygrok"));
+        match prev {
+            Some(v) => unsafe { std::env::set_var("MYGROK_HOME", v) },
+            None => unsafe { std::env::remove_var("MYGROK_HOME") },
+        }
     }
 }
