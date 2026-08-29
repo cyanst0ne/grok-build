@@ -228,7 +228,8 @@ fn managed_layout() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBu
 #[test]
 fn test_installer_manages_bin_entrypoints_gate() {
     assert!(installer_manages_bin_entrypoints("internal"));
-    assert!(installer_manages_bin_entrypoints("gh-release"));
+    // Fork gh-release must not manage ~/.grok/bin/{grok,agent}.
+    assert!(!installer_manages_bin_entrypoints("gh-release"));
     assert!(!installer_manages_bin_entrypoints("npm"));
     assert!(!installer_manages_bin_entrypoints("unknown"));
 }
@@ -995,15 +996,26 @@ fn test_reinstall_hint_npm_mentions_npm_command() {
 }
 
 #[test]
+#[serial_test::serial]
 fn test_reinstall_hint_gh_release_mentions_gh_command() {
+    let prev = std::env::var_os("GROK_GH_RELEASE_REPO");
+    unsafe { std::env::remove_var("GROK_GH_RELEASE_REPO") };
     let hint = reinstall_hint("gh-release", "stable");
+    match prev {
+        Some(v) => unsafe { std::env::set_var("GROK_GH_RELEASE_REPO", v) },
+        None => unsafe { std::env::remove_var("GROK_GH_RELEASE_REPO") },
+    }
     assert!(
         hint.contains("gh release download"),
         "should suggest gh release download: {hint}"
     );
     assert!(
-        hint.contains("xai-org-shared/grok-build"),
-        "should name the repo: {hint}"
+        hint.contains("cyanst0ne/grok-build"),
+        "should name the fork repo: {hint}"
+    );
+    assert!(
+        hint.contains("mygrok-*"),
+        "should match fork release assets: {hint}"
     );
 }
 
@@ -1578,6 +1590,19 @@ fn test_installer_allows_downgrade_gh_release() {
 }
 
 #[test]
+fn test_disk_version_for_npm_is_none() {
+    assert_eq!(disk_version_for_installer("npm"), None);
+    assert_eq!(disk_version_for_installer("unknown"), None);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn test_get_installer_defaults_to_gh_release() {
+    let _g = InstallerEnvGuard::isolate();
+    assert_eq!(get_installer().await, Some("gh-release"));
+}
+
+#[test]
 fn test_installer_allows_downgrade_npm_blocked() {
     // npm registries can return stale/misconfigured versions — no downgrade.
     assert!(!installer_allows_downgrade("npm"));
@@ -1876,7 +1901,7 @@ fn test_user_facing_constants_are_stable() {
     );
     assert_eq!(
         MSG_RUN_UPDATE_MANUAL,
-        "Run `grok update` to get the latest version."
+        "Run `mygrok update` to get the latest version."
     );
 }
 

@@ -469,6 +469,16 @@ fn fake_managed_install(version: &str) {
     .unwrap();
 }
 
+/// Fork layout under `MYGROK_HOME`.
+fn fake_mygrok_install(version: &str) {
+    let home = xai_grok_update::version::mygrok_home();
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let dest = bin.join(xai_grok_update::version::mygrok_bin_name());
+    std::fs::write(&dest, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::write(home.join("installed-version"), version).unwrap();
+}
+
 #[tokio::test]
 #[serial]
 async fn installed_on_disk_version_reads_symlink_target() {
@@ -487,7 +497,7 @@ async fn ensure_latest_skips_download_when_disk_current_but_still_relaunches() {
     // downloaded it): no download, but the stale running process must relaunch.
     let g = setup_gh("0.2.5");
     g.set_stable_only_stdout("v0.2.7\n");
-    fake_managed_install("0.2.7");
+    fake_mygrok_install("0.2.7");
 
     let outcome = ensure_latest_on_disk(&make_config("stable")).await.unwrap();
     assert_eq!(outcome.installed, None, "must not re-download");
@@ -504,7 +514,7 @@ async fn ensure_latest_skips_download_when_disk_current_but_still_relaunches() {
 async fn ensure_latest_noop_when_running_and_disk_current() {
     let g = setup_gh("0.2.7");
     g.set_stable_only_stdout("v0.2.7\n");
-    fake_managed_install("0.2.7");
+    fake_mygrok_install("0.2.7");
 
     let outcome = ensure_latest_on_disk(&make_config("stable")).await.unwrap();
     assert_eq!(outcome.installed, None);
@@ -519,7 +529,7 @@ async fn ensure_latest_relaunches_onto_rolled_back_disk() {
     // authoritative installer → downgrades allowed).
     let g = setup_gh("0.2.26");
     g.set_stable_only_stdout("v0.2.22\n");
-    fake_managed_install("0.2.22");
+    fake_mygrok_install("0.2.22");
 
     let outcome = ensure_latest_on_disk(&make_config("stable")).await.unwrap();
     assert_eq!(outcome.installed, None, "disk already at pointer");

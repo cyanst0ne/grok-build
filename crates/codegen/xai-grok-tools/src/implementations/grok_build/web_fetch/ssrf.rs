@@ -62,8 +62,10 @@ fn is_non_public_ipv4(ip: Ipv4Addr) -> bool {
         || ipv4_in_cidr(ip, [192, 0, 0, 0], 24)
         // TEST-NET-1 (RFC 5737)
         || ipv4_in_cidr(ip, [192, 0, 2, 0], 24)
-        // Benchmarking (RFC 2544)
-        || ipv4_in_cidr(ip, [198, 18, 0, 0], 15)
+        // NOTE: RFC 2544 benchmarking 198.18.0.0/15 is intentionally NOT blocked.
+        // Clash/mihomo fake-ip commonly maps public hostnames into this range;
+        // blocking it breaks web_fetch under fake-ip DNS. Real private ranges
+        // (RFC1918, link-local, CGNAT, etc.) remain blocked above/below.
         // TEST-NET-2 / TEST-NET-3
         || ipv4_in_cidr(ip, [198, 51, 100, 0], 24)
         || ipv4_in_cidr(ip, [203, 0, 113, 0], 24)
@@ -232,7 +234,8 @@ mod tests {
         assert!(is_non_public_ip("203.0.113.1".parse().unwrap()));
         assert!(is_non_public_ip("240.0.0.1".parse().unwrap()));
         assert!(is_non_public_ip("0.1.2.3".parse().unwrap()));
-        assert!(is_non_public_ip("198.18.0.1".parse().unwrap()));
+        // 198.18.0.0/15 is allowed (Clash fake-ip / RFC2544 benchmarking).
+        assert!(!is_non_public_ip("198.18.0.1".parse().unwrap()));
     }
 
     #[test]

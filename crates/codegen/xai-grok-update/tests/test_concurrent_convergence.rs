@@ -45,7 +45,7 @@ use common::{
 use xai_grok_update::auto_update::{
     CliUpdateTrigger, ensure_latest_on_disk, install_internal_from_base, run_update,
 };
-use xai_grok_update::version::installed_on_disk_version;
+use xai_grok_update::version::{installed_mygrok_version, installed_on_disk_version};
 
 /// Assert the active `~/.grok/bin/grok` resolves to the expected versioned
 /// binary, actually runs, and has exactly the expected content (the content
@@ -98,6 +98,17 @@ fn fake_managed_install(version: &str) {
         bin.join("grok"),
     )
     .unwrap();
+}
+
+/// Fork layout: `{MYGROK_HOME}/bin/mygrok` + `installed-version`.
+fn fake_mygrok_install(version: &str) {
+    let home = xai_grok_update::version::mygrok_home();
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let dest = bin.join(xai_grok_update::version::mygrok_bin_name());
+    std::fs::write(&dest, small_good_artifact()).unwrap();
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(home.join("installed-version"), version).unwrap();
 }
 
 /// Fake `gh` that logs argv to `<dir>/gh-args.log`, answers
@@ -171,7 +182,7 @@ async fn ensure_latest_downloads_once_then_converges_without_redownload() {
     assert_eq!(first.installed.as_deref(), Some("0.2.7"));
     assert!(first.relaunch_needed, "running 0.2.5 < disk 0.2.7");
     assert_eq!(gh_download_count(&g), 1, "first pass downloads");
-    assert_eq!(installed_on_disk_version().as_deref(), Some("0.2.7"));
+    assert_eq!(installed_mygrok_version().as_deref(), Some("0.2.7"));
 
     // Pass 2 (the pre-fix hourly re-download): disk already current →
     // no download, but the stale running process still gets the relaunch
@@ -202,7 +213,7 @@ async fn run_update_skips_download_when_disk_already_current() {
     let g = setup_gh_release("0.2.5");
     g.set_stable_only_stdout("v0.2.7\n");
     // Another process (TUI background download) already installed 0.2.7.
-    fake_managed_install("0.2.7");
+    fake_mygrok_install("0.2.7");
     let mut cfg = make_update_config("stable");
 
     let result = run_update(false, None, None, &mut cfg, CliUpdateTrigger::UserCommand)
@@ -231,7 +242,7 @@ async fn run_update_force_still_redownloads_when_disk_current() {
     }
     let g = setup_gh_release("0.2.7");
     g.set_stable_only_stdout("v0.2.7\n");
-    fake_managed_install("0.2.7");
+    fake_mygrok_install("0.2.7");
     let mut cfg = make_update_config("stable");
 
     let result = run_update(true, None, None, &mut cfg, CliUpdateTrigger::UserCommand)
@@ -372,17 +383,16 @@ async fn ensure_latest_repairs_dangling_symlink_by_downloading() {
         eprintln!("skipping: shell scripts cannot execute in this sandbox");
         return;
     }
-    // Dangling symlink + stale running process: the probe returns None, so
+    // Missing mygrok binary + stale stamp: the probe returns None, so
     // the decision falls back to the running version and the download runs,
     // repairing the install instead of wedging on "already up to date".
     let g = setup_gh_release("0.2.5");
     g.set_stable_only_stdout("v0.2.7\n");
-    let home = test_home();
-    let platform = host_platform();
-    fake_managed_install("0.2.7");
+    fake_mygrok_install("0.2.7");
     std::fs::remove_file(
-        home.join("downloads")
-            .join(format!("grok-0.2.7-{platform}")),
+        xai_grok_update::version::mygrok_home()
+            .join("bin")
+            .join(xai_grok_update::version::mygrok_bin_name()),
     )
     .unwrap();
     let cfg = make_update_config("stable");
@@ -392,11 +402,11 @@ async fn ensure_latest_repairs_dangling_symlink_by_downloading() {
     assert_eq!(
         outcome.installed.as_deref(),
         Some("0.2.7"),
-        "dangling symlink must be repaired by an actual download"
+        "missing mygrok binary must be repaired by an actual download"
     );
     assert_eq!(gh_download_count(&g), 1);
     assert_eq!(
-        installed_on_disk_version().as_deref(),
+        installed_mygrok_version().as_deref(),
         Some("0.2.7"),
         "probe healthy again after the repair install"
     );

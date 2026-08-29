@@ -132,6 +132,7 @@ impl XaiProtoBuilder {
         protos: impl IntoIterator<Item = &'a Path>,
         includes: impl IntoIterator<Item = &'a Path>,
     ) -> anyhow::Result<()> {
+        let protos: Vec<&Path> = protos.into_iter().collect();
         let includes = Vec::from_iter(includes);
 
         if let Some(protoc) = protoc {
@@ -139,6 +140,19 @@ impl XaiProtoBuilder {
                 "cargo:rerun-if-changed={}",
                 protoc.to_str().context("protoc path not UTF-8")?
             );
+        }
+
+        // Windows has no /dev/stdout or /dev/null. protoc's --dependency_out
+        // path used below is Unix-only; on Windows fall back to declaring the
+        // .proto inputs themselves as rebuild triggers (good enough for CI).
+        if cfg!(windows) {
+            for proto in &protos {
+                println!(
+                    "cargo:rerun-if-changed={}",
+                    proto.to_str().context("proto path not UTF-8")?
+                );
+            }
+            return Ok(());
         }
 
         // Can only process one input file when using --dependency_out=FILE.
