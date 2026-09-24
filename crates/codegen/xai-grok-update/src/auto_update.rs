@@ -31,7 +31,7 @@ pub enum UpdateRunMode {
 
 const PROMPT_UPDATE_NOW: &str = "Update now? [Y/n/d]";
 const MSG_AUTO_UPDATE_BACKGROUND: &str = "Auto-update running in background.";
-const MSG_RUN_UPDATE_MANUAL: &str = "Run `grok update` to get the latest version.";
+const MSG_RUN_UPDATE_MANUAL: &str = "Run `mygrok update` to get the latest version.";
 
 /// Manual-install one-liner for this platform's bootstrap installer. On Unix the variable must prefix `bash` (which runs
 /// install.sh), not `curl`. In `VAR=x curl … | bash` the assignment applies to `curl` only and install.sh would fall back
@@ -69,7 +69,10 @@ fn manual_install_cmd(channel: &str) -> String {
 fn reinstall_hint(installer: &str, channel: &str) -> String {
     match installer {
         "npm" => "Please reinstall via npm:\n  npm i -g @xai-official/grok".to_string(),
-        "gh-release" => "Please reinstall via GitHub Releases:\n  gh release download --repo xai-org-shared/grok-build --pattern 'grok-*' --output grok && chmod +x grok".to_string(),
+        "gh-release" => format!(
+            "Please reinstall via GitHub Releases:\n  gh release download --repo {} --pattern 'mygrok-*' --output mygrok",
+            crate::version::gh_release_repo()
+        ),
         WINGET => format!("Update with WinGet:\n  {UPGRADE_COMMAND}"),
         _ => format!("Please reinstall via:\n  {}", manual_install_cmd(channel)),
     }
@@ -480,7 +483,10 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
 /// symlink left over from a previous internal install would LIE about the npm install's version.
 fn disk_version_for_installer(installer: &str) -> Option<String> {
     match installer {
-        "internal" | "gh-release" => crate::version::installed_on_disk_version(),
+        // Official CDN layout (`~/.grok/bin/grok` versioned symlink).
+        "internal" => crate::version::installed_on_disk_version(),
+        // Fork layout: `{mygrok_home}/bin/mygrok` + `installed-version`.
+        "gh-release" => crate::version::installed_mygrok_version(),
         _ => None,
     }
 }
@@ -514,45 +520,20 @@ fn env_installer() -> Option<&'static str> {
     None
 }
 
+#[allow(clippy::unused_async)] // signature kept async; callers `.await` it
 pub async fn get_installer() -> Option<&'static str> {
-    // Only an explicit override outranks the WinGet location; npm hints and stale config do not.
-    if let Some(explicit) = std::env::var("GROK_INSTALLER")
-        .ok()
-        .as_deref()
-        .and_then(parse_grok_installer)
-    {
-        return Some(explicit);
-    }
-    if running_exe_matches(crate::winget::is_winget_package_path) {
-        return Some(WINGET);
-    }
     if let Some(i) = env_installer() {
         return Some(i);
     }
-    let cfg = config::load_config().await;
-    match cfg.cli.installer.as_deref() {
-        Some("npm") => Some("npm"),
-        Some("gh-release") => Some("gh-release"),
-        Some(_) => Some("internal"),
-        // A wiped config must not reclassify an npm install as internal:
-        // that re-enables downgrades and updates npm never sees.
-        None if running_exe_matches(is_under_node_modules) => Some("npm"),
-        None => Some("internal"),
-    }
+    // Ignore shared ~/.grok/config.toml installer and WinGet path detection:
+    // those describe the official grok install. mygrok always updates from
+    // this fork's GitHub Releases into ~/.mygrok.
+    Some("gh-release")
 }
 
-/// True when the running executable's raw or canonical path satisfies `is_match`. Package-manager entry points (the
-/// npm bin, WinGet's `Links\grok.exe`) link into the package, so the canonical path names the installer.
-fn running_exe_matches(is_match: fn(&std::path::Path) -> bool) -> bool {
-    match std::env::current_exe() {
-        Ok(exe) => is_match(&exe) || dunce::canonicalize(&exe).is_ok_and(|real| is_match(&real)),
-        Err(e) => {
-            tracing::debug!(error = %e, "current_exe unavailable; installer path checks skipped");
-            false
-        }
-    }
-}
-
+/// npm package path predicate. Production installer detection no longer calls
+/// this (mygrok ignores config and path hints); unit tests still cover it.
+#[cfg(test)]
 fn is_under_node_modules(exe: &std::path::Path) -> bool {
     exe.components().any(|c| c.as_os_str() == "node_modules")
 }
@@ -2145,7 +2126,9 @@ async fn sweep_old_exe_backups(old: &std::path::Path) {
 }
 
 fn installer_manages_bin_entrypoints(installer: &str) -> bool {
-    matches!(installer, "internal" | "gh-release")
+    // Fork gh-release must not heal ~/.grok/bin/{grok,agent} — that tree is
+    // the official install. mygrok lives in ~/.mygrok/bin.
+    matches!(installer, "internal")
 }
 
 #[cfg_attr(not(any(unix, windows)), allow(clippy::unused_async))]
@@ -2247,6 +2230,7 @@ async fn agent_exe_differs(
 
 /// Download a single asset from a GitHub release via `gh release download`.
 async fn gh_release_download(tag: &str, pattern: &str, dest: &std::path::Path) -> Result<()> {
+    let repo = crate::version::gh_release_repo();
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
@@ -2261,7 +2245,7 @@ async fn gh_release_download(tag: &str, pattern: &str, dest: &std::path::Path) -
         "download",
         tag,
         "--repo",
-        crate::version::GH_RELEASE_REPO,
+        repo.as_str(),
         "--pattern",
         pattern,
         "--output",
@@ -2283,92 +2267,82 @@ async fn gh_release_download(tag: &str, pattern: &str, dest: &std::path::Path) -
             "gh release download failed for {} tag {} from {}: {}",
             pattern,
             tag,
-            crate::version::GH_RELEASE_REPO,
+            repo,
             stderr.trim()
         );
     }
     Ok(())
 }
 
-/// Download and install grok from GitHub Releases (xai-org-shared/grok-build). Uses `gh release download` to fetch the
-/// binary matching the current platform. This works anywhere the `gh` CLI is authenticated, without needing npm or
-/// internal network access.
+/// Replace `{mygrok_home}/bin/mygrok[.exe]` with the downloaded asset.
+///
+/// Windows: [`windows_replace_exe`] (handles a running image). Unix: rename
+/// the previous file aside, then copy + chmod 0755.
+async fn replace_mygrok_bin(src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        return windows_replace_exe(src, dest).await;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(src, std::fs::Permissions::from_mode(0o755)).await?;
+        if tokio::fs::try_exists(dest).await.unwrap_or(false) {
+            let dest_name = dest
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "mygrok".to_string());
+            let old = dest.with_file_name(format!("{dest_name}.old"));
+            let _ = tokio::fs::rename(dest, &old).await;
+        }
+        tokio::fs::copy(src, dest).await?;
+        tokio::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755)).await?;
+        return Ok(());
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (src, dest);
+        anyhow::bail!("mygrok self-update is not supported on this platform");
+    }
+}
+
+/// Download and install mygrok from the fork's GitHub Releases.
+///
+/// Fetches `mygrok-windows-x64.exe` / `mygrok-macos-aarch64` from
+/// [`crate::version::gh_release_repo`] and writes `{mygrok_home}/bin/mygrok`.
+/// Does **not** touch `~/.grok/bin/grok` (official install).
 async fn install_gh_release(target: Option<&str>) -> Result<()> {
     let (os, arch) = detect_platform()?;
-    let platform = format!("{}-{}", os, arch);
+    let platform = format!("{os}-{arch}");
+    let asset = crate::version::mygrok_release_asset(os, arch)?;
 
     let version = match target {
         Some(v) => v.to_string(),
         None => crate::version::fetch_gh_release_version("stable").await?,
     };
 
-    let grok_home = grok_home();
-    let download_dir = grok_home.join("downloads");
-    let bin_dir = grok_home.join("bin");
+    let home = crate::version::mygrok_home();
+    let download_dir = home.join("downloads");
+    let bin_dir = home.join("bin");
     tokio::fs::create_dir_all(&download_dir).await?;
     tokio::fs::create_dir_all(&bin_dir).await?;
 
-    let binary_name = format!("grok-{}-{}", version, platform);
-    let binary_path = download_dir.join(&binary_name);
-    let tag = format!("v{}", version);
+    let download_path = download_dir.join(asset);
+    let dest_bin = bin_dir.join(crate::version::mygrok_bin_name());
+    let tag = format!("v{version}");
 
+    eprintln!("  Downloading mygrok v{version} ({platform}) from GitHub Releases...");
     eprintln!(
-        "  Downloading grok v{} ({}) from GitHub Releases...",
-        version, platform
+        "  repo: {}  asset: {asset}",
+        crate::version::gh_release_repo()
     );
 
-    gh_release_download(&tag, &binary_name, &binary_path).await?;
-
-    // chmod +x
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).await?;
-    }
-
-    // Atomic swap of ~/.grok/bin/{grok,agent} -> downloaded binary.
-    swap_managed_bin_links(&binary_path, &bin_dir).await?;
-
-    // Update grok-latest -> versioned binary so any existing symlinks that route
-    // through it (e.g. /usr/local/bin/grok -> ~/.grok/downloads/grok-latest)
-    // resolve to the newly installed version.
-    #[cfg(unix)]
-    {
-        let latest_path = download_dir.join("grok-latest");
-        let rel_target = relative_symlink_target(&binary_path, &latest_path);
-        if let Err(e) = atomic_symlink_swap(&rel_target, &latest_path).await {
-            tracing::warn!("Failed to update grok-latest symlink: {e}");
-        }
-    }
-
-    // Also update /usr/local/bin/{grok,agent} if either points directly into
-    // ~/.grok/downloads/ (legacy layout — skips the grok-latest indirection).
-    // Permission errors are ignored
-    #[cfg(unix)]
-    for name in ["grok", "agent"] {
-        let system_link = std::path::PathBuf::from(format!("/usr/local/bin/{name}"));
-        if let Ok(existing_target) = tokio::fs::read_link(&system_link).await {
-            let target_str = existing_target.to_string_lossy();
-            if target_str.contains(".grok/downloads/") && !target_str.ends_with("grok-latest") {
-                let _ = atomic_symlink_swap(&binary_path, &system_link).await;
-            }
-        }
-    }
-
-    remove_stale_pager(&bin_dir).await;
+    gh_release_download(&tag, asset, &download_path).await?;
+    replace_mygrok_bin(&download_path, &dest_bin).await?;
+    crate::version::write_mygrok_installed_version(&version);
 
     eprintln!();
-
-    // Current, N-1, and any leftover a live process is still executing.
-    cleanup_old_downloads(&download_dir, "grok", &version).await;
-    cleanup_old_downloads(&download_dir, "grok-pager", &version).await;
-
-    // Persist installer to config.toml so future runs auto-detect gh-release.
-    let _ = config::update_config(|st| {
-        st.cli.installer = Some("gh-release".to_string());
-    })
-    .await;
-
+    // Do not persist cli.installer into shared ~/.grok/config.toml.
     Ok(())
 }
 
@@ -2592,15 +2566,7 @@ pub async fn run_update(
             return Ok(None);
         }
     };
-    // Persist installer if not already saved
-    let cfg = config::load_config().await;
-    if cfg.cli.installer.is_none() {
-        let _ = config::update_config(|st| {
-            st.cli.installer = Some(installer.to_string());
-        })
-        .await;
-    }
-
+    // Do not persist installer into shared ~/.grok/config.toml (official grok).
     heal_managed_install(installer).await;
 
     let current_version = get_installed_grok_version();
@@ -2621,7 +2587,7 @@ pub async fn run_update(
         {
             tracing::warn!("Failed to persist auto_update=false for pinned install: {e}");
         }
-        eprintln!("  ✓ grok v{} installed successfully!", version);
+        eprintln!("  ✓ mygrok v{} installed successfully!", version);
         eprintln!("  Please restart Grok.");
         return Ok(Some(version.to_string()));
     }
@@ -2739,7 +2705,7 @@ pub async fn run_update(
     let stable_ptr = try_fetch_stable_pointer().await;
     write_version_cache(target_version, stable_ptr.as_deref()).await;
     refresh_deployment_config().await;
-    eprintln!("  ✓ grok v{} installed successfully!", target_version);
+    eprintln!("  ✓ mygrok v{} installed successfully!", target_version);
 
     if !force && std::env::var_os("GROK_AUTO_UPDATE").is_none() {
         eprintln!("  Please restart Grok.");
